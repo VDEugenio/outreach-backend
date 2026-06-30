@@ -1,7 +1,7 @@
 import os
 import random
 import string
-from datetime import datetime, timezone
+from typing import Optional
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -38,9 +38,11 @@ def init_db():
         with conn.cursor() as cur:
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS contacts (
-                    uid        TEXT PRIMARY KEY,
-                    slug       TEXT NOT NULL UNIQUE,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    uid          TEXT PRIMARY KEY,
+                    first_name   TEXT,
+                    last_name    TEXT,
+                    linkedin_url TEXT,
+                    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
                 CREATE TABLE IF NOT EXISTS visits (
                     id         SERIAL PRIMARY KEY,
@@ -65,12 +67,16 @@ def generate_uid():
 # ── Models ────────────────────────────────────────────────────────────────────
 
 class ContactRequest(BaseModel):
-    slug: str
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    linkedin_url: Optional[str] = None
 
 
 class ContactResponse(BaseModel):
     uid: str
-    slug: str
+    first_name: Optional[str]
+    last_name: Optional[str]
+    linkedin_url: Optional[str]
     tracking_url: str
 
 
@@ -78,20 +84,25 @@ class ContactResponse(BaseModel):
 
 @app.post("/contacts", response_model=ContactResponse)
 def upsert_contact(body: ContactRequest):
-    slug = body.slug.strip().lower()
-    if not slug:
-        raise HTTPException(status_code=400, detail="slug is required")
-
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            # Return existing UID if slug already has one
-            cur.execute("SELECT uid FROM contacts WHERE slug = %s", (slug,))
-            row = cur.fetchone()
+            # Return existing UID if this linkedin_url already has one
+            if body.linkedin_url:
+                cur.execute("SELECT uid FROM contacts WHERE linkedin_url = %s", (body.linkedin_url,))
+                row = cur.fetchone()
+            else:
+                row = None
+
             if row:
                 uid = row[0]
+                # Update name fields in case they changed
+                cur.execute(
+                    "UPDATE contacts SET first_name = %s, last_name = %s WHERE uid = %s",
+                    (body.first_name, body.last_name, uid),
+                )
+                conn.commit()
             else:
-                # Generate a collision-free UID
                 for _ in range(10):
                     uid = generate_uid()
                     cur.execute("SELECT 1 FROM contacts WHERE uid = %s", (uid,))
@@ -101,8 +112,8 @@ def upsert_contact(body: ContactRequest):
                     raise HTTPException(status_code=500, detail="Could not generate unique UID")
 
                 cur.execute(
-                    "INSERT INTO contacts (uid, slug) VALUES (%s, %s)",
-                    (uid, slug),
+                    "INSERT INTO contacts (uid, first_name, last_name, linkedin_url) VALUES (%s, %s, %s, %s)",
+                    (uid, body.first_name, body.last_name, body.linkedin_url),
                 )
                 conn.commit()
     finally:
@@ -110,7 +121,9 @@ def upsert_contact(body: ContactRequest):
 
     return ContactResponse(
         uid=uid,
-        slug=slug,
+        first_name=body.first_name,
+        last_name=body.last_name,
+        linkedin_url=body.linkedin_url,
         tracking_url=f"https://vaughneugenio.com/r/{uid}",
     )
 
@@ -120,18 +133,25 @@ def resolve_uid(uid: str):
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT slug FROM contacts WHERE uid = %s", (uid,))
+            cur.execute(
+                "SELECT first_name, last_name, linkedin_url FROM contacts WHERE uid = %s",
+                (uid,)
+            )
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="Link not found")
-            slug = row[0]
 
             cur.execute("INSERT INTO visits (uid) VALUES (%s)", (uid,))
             conn.commit()
     finally:
         release_conn(conn)
 
-    return {"slug": slug, "linkedin_url": f"https://www.linkedin.com/in/{slug}"}
+    return {
+        "uid": uid,
+        "first_name": row[0],
+        "last_name": row[1],
+        "linkedin_url": row[2],
+    }
 
 
 @app.get("/contacts/{uid}/visits")
@@ -139,7 +159,10 @@ def get_visits(uid: str):
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT slug FROM contacts WHERE uid = %s", (uid,))
+            cur.execute(
+                "SELECT first_name, last_name, linkedin_url FROM contacts WHERE uid = %s",
+                (uid,)
+            )
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="Contact not found")
@@ -152,4 +175,11 @@ def get_visits(uid: str):
     finally:
         release_conn(conn)
 
-    return {"uid": uid, "slug": row[0], "visit_count": len(visits), "visits": visits}
+    return {
+        "uid": uid,
+        "first_name": row[0],
+        "last_name": row[1],
+        "linkedin_url": row[2],
+        "visit_count": len(visits),
+        "visits": visits,
+    }
