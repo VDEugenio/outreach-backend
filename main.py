@@ -8,7 +8,7 @@ load_dotenv()
 
 import psycopg2
 import psycopg2.pool
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -47,6 +47,7 @@ def init_db():
                 CREATE TABLE IF NOT EXISTS visits (
                     id         SERIAL PRIMARY KEY,
                     uid        TEXT NOT NULL REFERENCES contacts(uid),
+                    ip         TEXT,
                     visited_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
             """)
@@ -129,7 +130,8 @@ def upsert_contact(body: ContactRequest):
 
 
 @app.get("/r/{uid}")
-def resolve_uid(uid: str):
+def resolve_uid(uid: str, request: Request):
+    ip = request.headers.get("x-forwarded-for", request.client.host).split(",")[0].strip()
     conn = get_conn()
     try:
         with conn.cursor() as cur:
@@ -141,7 +143,7 @@ def resolve_uid(uid: str):
             if not row:
                 raise HTTPException(status_code=404, detail="Link not found")
 
-            cur.execute("INSERT INTO visits (uid) VALUES (%s)", (uid,))
+            cur.execute("INSERT INTO visits (uid, ip) VALUES (%s, %s)", (uid, ip))
             conn.commit()
     finally:
         release_conn(conn)
@@ -168,10 +170,10 @@ def get_visits(uid: str):
                 raise HTTPException(status_code=404, detail="Contact not found")
 
             cur.execute(
-                "SELECT visited_at FROM visits WHERE uid = %s ORDER BY visited_at DESC",
+                "SELECT visited_at, ip FROM visits WHERE uid = %s ORDER BY visited_at DESC",
                 (uid,),
             )
-            visits = [r[0].isoformat() for r in cur.fetchall()]
+            visits = [{"visited_at": r[0].isoformat(), "ip": r[1]} for r in cur.fetchall()]
     finally:
         release_conn(conn)
 
