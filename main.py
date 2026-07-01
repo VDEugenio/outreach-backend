@@ -21,11 +21,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-pool = psycopg2.pool.SimpleConnectionPool(1, 10, dsn=os.environ["DATABASE_URL"])
+DSN = os.environ["DATABASE_URL"]
+pool = psycopg2.pool.SimpleConnectionPool(1, 10, dsn=DSN)
 
 
 def get_conn():
-    return pool.getconn()
+    conn = pool.getconn()
+    try:
+        conn.cursor().execute("SELECT 1")
+    except Exception:
+        # Connection is dead — replace it
+        pool.putconn(conn, close=True)
+        conn = psycopg2.connect(DSN)
+        pool._pool.append(conn)
+        conn = pool.getconn()
+    return conn
 
 
 def release_conn(conn):
