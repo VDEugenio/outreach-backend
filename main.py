@@ -1,6 +1,7 @@
 import os
 import random
 import string
+from datetime import date, datetime
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -8,6 +9,7 @@ load_dotenv()
 
 import psycopg2
 import psycopg2.pool
+from psycopg2.extras import Json
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -60,6 +62,29 @@ def init_db():
                     ip         TEXT,
                     visited_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
+                ALTER TABLE contacts
+                    ADD COLUMN IF NOT EXISTS title             TEXT,
+                    ADD COLUMN IF NOT EXISTS seniority         TEXT,
+                    ADD COLUMN IF NOT EXISTS departments       TEXT,
+                    ADD COLUMN IF NOT EXISTS company_name      TEXT,
+                    ADD COLUMN IF NOT EXISTS company_size      INTEGER,
+                    ADD COLUMN IF NOT EXISTS company_industry  TEXT,
+                    ADD COLUMN IF NOT EXISTS city              TEXT,
+                    ADD COLUMN IF NOT EXISTS state             TEXT,
+                    ADD COLUMN IF NOT EXISTS country           TEXT,
+                    ADD COLUMN IF NOT EXISTS years_at_company  NUMERIC,
+                    ADD COLUMN IF NOT EXISTS email_status      TEXT,
+                    ADD COLUMN IF NOT EXISTS apollo_raw        JSONB,
+                    ADD COLUMN IF NOT EXISTS premium           BOOLEAN,
+                    ADD COLUMN IF NOT EXISTS follower_count    INTEGER,
+                    ADD COLUMN IF NOT EXISTS connection_degree TEXT,
+                    ADD COLUMN IF NOT EXISTS target_role       TEXT,
+                    ADD COLUMN IF NOT EXISTS target_company    TEXT,
+                    ADD COLUMN IF NOT EXISTS contacted_at      TIMESTAMPTZ,
+                    ADD COLUMN IF NOT EXISTS channel           TEXT,
+                    ADD COLUMN IF NOT EXISTS responded         BOOLEAN,
+                    ADD COLUMN IF NOT EXISTS responded_at      TIMESTAMPTZ,
+                    ADD COLUMN IF NOT EXISTS outcome           TEXT;
             """)
         conn.commit()
     finally:
@@ -75,12 +100,50 @@ def generate_uid():
     return "".join(random.choices(CHARS, k=3))
 
 
+# ── Apollo field derivation ───────────────────────────────────────────────────
+
+def derive_apollo_fields(person: dict) -> dict:
+    """Promote the queryable fields out of a raw Apollo person object."""
+    if not person:
+        return {}
+    org = person.get("organization") or {}
+
+    years = None
+    for job in person.get("employment_history") or []:
+        if job.get("current") and job.get("start_date"):
+            try:
+                start = datetime.strptime(job["start_date"][:10], "%Y-%m-%d").date()
+                years = round((date.today() - start).days / 365.25, 1)
+            except ValueError:
+                pass
+            break
+
+    deps = person.get("departments")
+    return {
+        "title": person.get("title"),
+        "seniority": person.get("seniority"),
+        "departments": ", ".join(deps) if deps else None,
+        "company_name": person.get("organization_name") or org.get("name"),
+        "company_size": org.get("estimated_num_employees"),
+        "company_industry": org.get("industry"),
+        "city": person.get("city"),
+        "state": person.get("state"),
+        "country": person.get("country"),
+        "years_at_company": years,
+        "email_status": person.get("email_status"),
+    }
+
+
 # ── Models ────────────────────────────────────────────────────────────────────
 
 class ContactRequest(BaseModel):
     first_name: Optional[str] = None
     last_name: Optional[str] = None
     linkedin_url: Optional[str] = None
+    apollo_raw: Optional[dict] = None
+    page: Optional[dict] = None  # {premium, follower_count, connection_degree}
+    target_role: Optional[str] = None
+    target_company: Optional[str] = None
 
 
 class ContactResponse(BaseModel):
@@ -126,7 +189,27 @@ def upsert_contact(body: ContactRequest):
                     "INSERT INTO contacts (uid, first_name, last_name, linkedin_url) VALUES (%s, %s, %s, %s)",
                     (uid, body.first_name, body.last_name, body.linkedin_url),
                 )
-                conn.commit()
+
+            # Apply enrichment fields (both insert and update paths)
+            fields = {}
+            if body.apollo_raw:
+                fields.update(derive_apollo_fields(body.apollo_raw))
+                fields["apollo_raw"] = Json(body.apollo_raw)
+            if body.page:
+                fields["premium"] = body.page.get("premium")
+                fields["follower_count"] = body.page.get("follower_count")
+                fields["connection_degree"] = body.page.get("connection_degree")
+            if body.target_role:
+                fields["target_role"] = body.target_role
+            if body.target_company:
+                fields["target_company"] = body.target_company
+            if fields:
+                sets = ", ".join(f"{k} = %s" for k in fields)
+                cur.execute(
+                    f"UPDATE contacts SET {sets} WHERE uid = %s",
+                    (*fields.values(), uid),
+                )
+            conn.commit()
     finally:
         release_conn(conn)
 
@@ -137,6 +220,27 @@ def upsert_contact(body: ContactRequest):
         linkedin_url=body.linkedin_url,
         tracking_url=f"https://vaughneugenio.com/r/{uid}",
     )
+
+
+class ContactedRequest(BaseModel):
+    channel: Optional[str] = None  # 'copy' | 'email'
+
+
+@app.post("/contacts/{uid}/contacted")
+def mark_contacted(uid: str, body: ContactedRequest):
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE contacts SET contacted_at = NOW(), channel = %s WHERE uid = %s RETURNING uid",
+                (body.channel, uid),
+            )
+            if not cur.fetchone():
+                raise HTTPException(status_code=404, detail="Contact not found")
+        conn.commit()
+    finally:
+        release_conn(conn)
+    return {"ok": True}
 
 
 @app.get("/r/{uid}")
