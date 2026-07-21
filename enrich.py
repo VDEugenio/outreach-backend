@@ -57,6 +57,10 @@ def main():
 
             fields = derive_apollo_fields(person)
             fields["apollo_raw"] = Json(person)
+            # Overwrite names — early rows have bad names from slug parsing
+            if person.get("first_name"):
+                fields["first_name"] = person["first_name"]
+                fields["last_name"] = person.get("last_name")
             sets = ", ".join(f"{k} = %s" for k in fields)
             with conn.cursor() as cur:
                 cur.execute(
