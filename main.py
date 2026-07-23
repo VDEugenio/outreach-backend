@@ -62,6 +62,8 @@ def init_db():
                     ip         TEXT,
                     visited_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
+                ALTER TABLE visits
+                    ADD COLUMN IF NOT EXISTS user_agent TEXT;
                 ALTER TABLE contacts
                     ADD COLUMN IF NOT EXISTS title             TEXT,
                     ADD COLUMN IF NOT EXISTS seniority         TEXT,
@@ -243,9 +245,31 @@ def mark_contacted(uid: str, body: ContactedRequest):
     return {"ok": True}
 
 
+BOT_UA_MARKERS = [
+    "linkedinbot", "slackbot", "twitterbot", "facebookexternalhit", "whatsapp",
+    "telegrambot", "discordbot", "skypeuripreview", "googlebot", "bingbot",
+    "bot", "crawler", "spider", "apache-httpclient", "python-requests",
+    "curl", "wget", "headlesschrome",
+]
+
+
+def is_bot(ua: str) -> bool:
+    if not ua:
+        return True
+    ua_lower = ua.lower()
+    return any(marker in ua_lower for marker in BOT_UA_MARKERS)
+
+
 @app.get("/r/{uid}")
 def resolve_uid(uid: str, request: Request):
-    ip = request.headers.get("x-forwarded-for", request.client.host).split(",")[0].strip()
+    # The RAG-backend proxy forwards the real visitor via custom headers,
+    # because Railway's edge strips X-Forwarded-For from proxied requests.
+    ip = (
+        request.headers.get("x-client-ip")
+        or request.headers.get("x-forwarded-for", request.client.host).split(",")[0].strip()
+    )
+    ua = request.headers.get("x-client-ua") or request.headers.get("user-agent", "")
+
     conn = get_conn()
     try:
         with conn.cursor() as cur:
@@ -257,7 +281,12 @@ def resolve_uid(uid: str, request: Request):
             if not row:
                 raise HTTPException(status_code=404, detail="Link not found")
 
-            cur.execute("INSERT INTO visits (uid, ip) VALUES (%s, %s)", (uid, ip))
+            # Bots (link-preview crawlers etc.) are served but not counted
+            if not is_bot(ua):
+                cur.execute(
+                    "INSERT INTO visits (uid, ip, user_agent) VALUES (%s, %s, %s)",
+                    (uid, ip, ua),
+                )
             conn.commit()
     finally:
         release_conn(conn)
@@ -284,10 +313,13 @@ def get_visits(uid: str):
                 raise HTTPException(status_code=404, detail="Contact not found")
 
             cur.execute(
-                "SELECT visited_at, ip FROM visits WHERE uid = %s ORDER BY visited_at DESC",
+                "SELECT visited_at, ip, user_agent FROM visits WHERE uid = %s ORDER BY visited_at DESC",
                 (uid,),
             )
-            visits = [{"visited_at": r[0].isoformat(), "ip": r[1]} for r in cur.fetchall()]
+            visits = [
+                {"visited_at": r[0].isoformat(), "ip": r[1], "user_agent": r[2]}
+                for r in cur.fetchall()
+            ]
     finally:
         release_conn(conn)
 
