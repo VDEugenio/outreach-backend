@@ -63,7 +63,8 @@ def init_db():
                     visited_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
                 ALTER TABLE visits
-                    ADD COLUMN IF NOT EXISTS user_agent TEXT;
+                    ADD COLUMN IF NOT EXISTS user_agent TEXT,
+                    ADD COLUMN IF NOT EXISTS kind TEXT;
                 ALTER TABLE contacts
                     ADD COLUMN IF NOT EXISTS title             TEXT,
                     ADD COLUMN IF NOT EXISTS seniority         TEXT,
@@ -281,12 +282,12 @@ def resolve_uid(uid: str, request: Request):
             if not row:
                 raise HTTPException(status_code=404, detail="Link not found")
 
-            # Bots (link-preview crawlers etc.) are served but not counted
-            if not is_bot(ua):
-                cur.execute(
-                    "INSERT INTO visits (uid, ip, user_agent) VALUES (%s, %s, %s)",
-                    (uid, ip, ua),
-                )
+            # Log every fetch; bots are kept but marked so stats can exclude them
+            kind = "bot" if is_bot(ua) else "human"
+            cur.execute(
+                "INSERT INTO visits (uid, ip, user_agent, kind) VALUES (%s, %s, %s, %s)",
+                (uid, ip, ua, kind),
+            )
             conn.commit()
     finally:
         release_conn(conn)
@@ -313,7 +314,8 @@ def get_visits(uid: str):
                 raise HTTPException(status_code=404, detail="Contact not found")
 
             cur.execute(
-                "SELECT visited_at, ip, user_agent FROM visits WHERE uid = %s ORDER BY visited_at DESC",
+                "SELECT visited_at, ip, user_agent FROM visits "
+                "WHERE uid = %s AND kind = 'human' ORDER BY visited_at DESC",
                 (uid,),
             )
             visits = [
